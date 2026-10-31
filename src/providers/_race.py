@@ -18,6 +18,9 @@ _ep_latency: dict = {}
 _failures: dict = {}
 _watch_cache: dict = {}
 
+# At most this many provider scrapers run at once in one instance, so a burst of requests cannot start dozens of them together
+_SEM = asyncio.Semaphore(3)
+
 
 def _load(name):
     try:
@@ -66,7 +69,8 @@ async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
         return name, hit[1], 0.0, True
     t0 = time.time()
     try:
-        streams = await asyncio.wait_for(mod.watch(anilist_id, audio, ep, ctx), WATCH_TIMEOUT)
+        async with _SEM:
+            streams = await asyncio.wait_for(mod.watch(anilist_id, audio, ep, ctx), WATCH_TIMEOUT)
         dt = round(time.time() - t0, 3)
         if streams:
             _watch_cache[key] = (time.time() + WATCH_CACHE_TTL, streams)
@@ -92,9 +96,7 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
                         "requestedProvider": preferred,
                         "timings": {name: {"seconds": dt, "ok": True}},
                         "defaultProvider": default_provider()}
-            mods = [m for m in mods if m[0] != preferred]
-            if not mods:
-                return None
+            return None  # strict: the caller asked for this provider only; it has nothing, so say so (do not start the others)
     pending = {asyncio.ensure_future(_watch_one(mod, name, anilist_id, ep, audio, ctx))
                for name, mod in mods}
     timings: dict = {}
@@ -111,21 +113,9 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
             if winner is not None:
                 break
     finally:
-
-        if pending:
-            try:
-                done2, pending2 = await asyncio.wait(pending, timeout=8.0)
-                for task in done2:
-                    try:
-                        name, streams, dt, ok = task.result()
-                        timings[name] = {"seconds": dt, "ok": ok}
-                        record_latency(name, dt, ok)
-                    except Exception:
-                        pass
-                pending = pending2
-            finally:
-                for task in pending:
-                    task.cancel()
+        # the others are stopped as soon as one provider has won (they used to be given 8 more seconds)
+        for task in pending:
+            task.cancel()
     if winner is None:
         return None
     winner["timings"] = timings

@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Query, HTTPException
+from fastapi.responses import JSONResponse
 from typing import Optional
 import httpx
 import base64
+import time
 
 from src.queries import MEDIA_LIST_FIELDS, MEDIA_FULL_FIELDS
 from src.parser import proxy_deep_images, inject_source_slugs, encode_pipe_request, decode_pipe_response
@@ -10,6 +12,11 @@ from src.config import iter_miruro_pipe_targets
 from src.providers import _race as provider_race
 
 router = APIRouter()
+
+# Vercel's CDN keeps these answers, so the same episode asked again does not run the scrapers again
+HIT_CACHE = {"Cache-Control": "public, s-maxage=300, stale-while-revalidate=600"}
+MISS_CACHE = {"Cache-Control": "public, s-maxage=120, stale-while-revalidate=300"}
+_format_cache: dict = {}
 
 
 @router.get("/search")
@@ -533,20 +540,26 @@ async def extract_simple(
     if query.isdigit():
         anilist_id = int(query)
 
-        gql = """
-        query ($id: Int) {
-            Media(id: $id, type: ANIME) {
-                id
-                format
+        cached_fmt = _format_cache.get(anilist_id)
+        if cached_fmt and cached_fmt[0] > time.time():
+            media_format = cached_fmt[1]
+        else:
+            gql = """
+            query ($id: Int) {
+                Media(id: $id, type: ANIME) {
+                    id
+                    format
+                }
             }
-        }
-        """
-        media_data = await anilist_query(gql, {"id": anilist_id})
-        media = media_data.get("Media")
-        if not media:
-            raise HTTPException(status_code=404, detail="anime not found")
+            """
+            media_data = await anilist_query(gql, {"id": anilist_id})
+            media = media_data.get("Media")
+            if not media:
+                raise HTTPException(status_code=404, detail="anime not found", headers=MISS_CACHE)
+            media_format = media.get("format")
+            _format_cache[anilist_id] = (time.time() + 6 * 3600, media_format)
 
-        if media.get("format") == "MOVIE":
+        if media_format == "MOVIE":
             episode = 1
     else:
 
@@ -584,9 +597,13 @@ async def extract_simple(
                 "streams": raced["streams"],
                 "subtitles": provider_race.merge_subtitles(raced["streams"]),
             }
-            return proxy_deep_images(result)
+            return JSONResponse(proxy_deep_images(result), headers=HIT_CACHE)
     except Exception as e:
         print(f"[KUHI API] native race failed, falling back to pipe: {e}")
+
+    # A named provider was asked and has nothing: answer right away (the site asks the providers itself, one by one)
+    if wanted:
+        raise HTTPException(status_code=404, detail=f"no {audio} stream from {wanted} for episode {episode}", headers=MISS_CACHE)
 
     data = await fetch_raw_episodes(anilist_id)
     providers = data.get("providers", {})
