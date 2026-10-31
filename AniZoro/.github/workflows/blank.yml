@@ -1,0 +1,33 @@
+name: Auto-Extract
+on:
+  push:
+    paths:
+      - 'updates/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract and Copy Files
+        run: |
+          mkdir -p temp_dir
+          find updates -maxdepth 1 -name "*.zip" -print0 | xargs -0 -I {} unzip -o {} -d temp_dir
+          rsync -avm --exclude='.git' temp_dir/ .
+          rm -rf temp_dir
+      - name: Commit and Push
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          # This line checks if there are changes before trying to commit
+          if git diff-index --quiet HEAD --; then
+            echo "No changes to commit."
+          else
+            git commit -m "Automated update"
+            git push
+          fi
+          
